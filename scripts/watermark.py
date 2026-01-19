@@ -35,8 +35,8 @@ def add_watermark_to_pdf(input_pdf_path, output_pdf_path, watermark_text):
         # Draw watermark pattern
         for i in range(-2, 3):
             for j in range(-2, 3):
-                x = i * 300
-                y = j * 200
+                x = i * 350
+                y = j * 250
                 can.drawString(x, y, watermark_text)
         
         can.restoreState()
