@@ -53,50 +53,67 @@ jobs:
     
     - name: 🔍 Get files to process
       id: get_files
-      shell: python
+      shell: bash
       run: |
-        import os, json, sys, subprocess
+        echo "Event: ${{ github.event_name }}"
+        echo "Scope: ${{ github.event.inputs.generation_scope || 'changed' }}"
         
-        event_name = os.environ.get('GITHUB_EVENT_NAME')
-        scope = os.environ.get('INPUT_GENERATION_SCOPE', 'all')
-        specific = os.environ.get('INPUT_SPECIFIC_FILES', '')
+        FILES_TO_PROCESS=""
         
-        files_to_process = []
+        # For manual triggers
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          SCOPE="${{ github.event.inputs.generation_scope || 'all' }}"
+          SPECIFIC="${{ github.event.inputs.specific_files || '' }}"
+          
+          if [ "$SCOPE" == "all" ]; then
+            # Find all .md files in doc/
+            FILES_TO_PROCESS=$(find doc -name "*.md" -type f | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          elif [ "$SCOPE" == "specific" ] && [ -n "$SPECIFIC" ]; then
+            # Process specific files
+            JSON_FILES="["
+            FIRST=true
+            IFS=',' read -ra FILES <<< "$SPECIFIC"
+            for file in "${FILES[@]}"; do
+              file=$(echo "$file" | xargs)  # Trim whitespace
+              if [[ "$file" == *.md ]] && [ -f "$file" ]; then
+                if [ "$FIRST" = true ]; then
+                  FIRST=false
+                else
+                  JSON_FILES="$JSON_FILES,"
+                fi
+                JSON_FILES="$JSON_FILES\"$file\""
+              fi
+            done
+            JSON_FILES="$JSON_FILES]"
+            FILES_TO_PROCESS="$JSON_FILES"
+          fi
+        else
+          # Push event - get changed .md files
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD -- 'doc/**/*.md' 2>/dev/null || echo "")
+          if [ -n "$CHANGED_FILES" ]; then
+            JSON_FILES="["
+            FIRST=true
+            while IFS= read -r file; do
+              if [ -n "$file" ] && [ -f "$file" ]; then
+                if [ "$FIRST" = true ]; then
+                  FIRST=false
+                else
+                  JSON_FILES="$JSON_FILES,"
+                fi
+                JSON_FILES="$JSON_FILES\"$file\""
+              fi
+            done <<< "$CHANGED_FILES"
+            JSON_FILES="$JSON_FILES]"
+            FILES_TO_PROCESS="$JSON_FILES"
+          fi
+        fi
         
-        if event_name == 'workflow_dispatch':
-            if scope == 'all':
-                # Find all .md files in doc/
-                for root, dirs, files in os.walk('doc'):
-                    for file in files:
-                        if file.endswith('.md'):
-                            files_to_process.append(os.path.join(root, file))
-            elif scope == 'specific' and specific:
-                # Process specific files
-                for file_path in specific.split(','):
-                    file_path = file_path.strip()
-                    if file_path.endswith('.md') and os.path.exists(file_path):
-                        files_to_process.append(file_path)
-        else:
-            # Push event - get changed .md files
-            try:
-                # Get list of changed files from git diff
-                result = subprocess.run(
-                    ['git', 'diff', '--name-only', 'HEAD~1', 'HEAD', '--', 'doc/**/*.md'],
-                    capture_output=True,
-                    text=True
-                )
-                if result.stdout:
-                    files = [f.strip() for f in result.stdout.split('\n') if f.strip()]
-                    files_to_process = [f for f in files if os.path.exists(f)]
-            except:
-                pass
+        if [ -z "$FILES_TO_PROCESS" ]; then
+          FILES_TO_PROCESS="[]"
+        fi
         
-        print(f"Found {len(files_to_process)} file(s) to process")
-        print(f"::set-output name=files::{json.dumps(files_to_process)}")
-      env:
-        GITHUB_EVENT_NAME: ${{ github.event_name }}
-        INPUT_GENERATION_SCOPE: ${{ github.event.inputs.generation_scope || 'all' }}
-        INPUT_SPECIFIC_FILES: ${{ github.event.inputs.specific_files || '' }}
+        echo "Files to process: $FILES_TO_PROCESS"
+        echo "files=$FILES_TO_PROCESS" >> $GITHUB_OUTPUT
     
     - name: 🖨️ Generate PDFs with watermarks
       id: generate
@@ -105,6 +122,8 @@ jobs:
         GITHUB_ACTOR: ${{ github.actor }}
         INPUT_WATERMARK_TEXT: ${{ github.event.inputs.watermark_text || '' }}
       run: |
+        echo "Starting PDF generation..."
+        
         # Create timestamp for watermark
         TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
         
@@ -125,14 +144,14 @@ jobs:
           exit 0
         fi
         
-        # Convert JSON array to bash array
-        eval "FILES_ARRAY=$FILES_TO_PROCESS"
+        # Parse JSON array
+        FILES_ARRAY=$(echo "$FILES_TO_PROCESS" | python3 -c "import sys, json; data=json.load(sys.stdin); print(' '.join(data))")
         
         GENERATED_COUNT=0
         GENERATED_FILES=""
         
         # Process each file
-        for md_file in "${FILES_ARRAY[@]}"; do
+        for md_file in $FILES_ARRAY; do
           if [ ! -f "$md_file" ]; then
             echo "File not found: $md_file"
             continue
@@ -144,7 +163,9 @@ jobs:
           pdf_file="${md_file%.md}.pdf"
           
           # Convert markdown to PDF using pandoc
-          if pandoc "$md_file" -o "/tmp/temp.pdf" --pdf-engine=xelatex \
+          TEMP_PDF="/tmp/$(basename "$pdf_file")"
+          
+          if pandoc "$md_file" -o "$TEMP_PDF" --pdf-engine=xelatex \
             -V geometry:margin=1in -V fontsize=11pt --toc --toc-depth=3; then
             
             # Add watermark using Python
@@ -162,15 +183,23 @@ def add_watermark(input_pdf, output_pdf, watermark_text):
     
     for page in reader.pages:
         packet = BytesIO()
-        can = canvas.Canvas(packet, pagesize=letter)
-        can.setFont('Helvetica-Bold', 36)
-        can.setFillColor(gray, alpha=0.2)
+        page_width = float(page.mediabox.width)
+        page_height = float(page.mediabox.height)
+        
+        can = canvas.Canvas(packet, pagesize=(page_width, page_height))
+        can.setFont('Helvetica-Bold', 40)
+        can.setFillColor(gray, alpha=0.15)
         can.saveState()
-        can.translate(300, 400)
+        can.translate(page_width / 2, page_height / 2)
         can.rotate(45)
-        can.drawString(0, 0, watermark_text)
-        can.drawString(100, 100, watermark_text)
-        can.drawString(-100, -100, watermark_text)
+        
+        # Draw watermark multiple times for coverage
+        for i in range(-2, 3):
+            for j in range(-2, 3):
+                x = i * 300
+                y = j * 200
+                can.drawString(x, y, watermark_text)
+        
         can.restoreState()
         can.save()
         
@@ -183,19 +212,19 @@ def add_watermark(input_pdf, output_pdf, watermark_text):
     with open(output_pdf, 'wb') as f:
         writer.write(f)
 
-add_watermark('/tmp/temp.pdf', '$pdf_file', '$WATERMARK_TEXT')
+add_watermark('$TEMP_PDF', '$pdf_file', '$WATERMARK_TEXT')
             "
             
             if [ $? -eq 0 ] && [ -f "$pdf_file" ]; then
               echo "✓ Generated: $pdf_file"
               GENERATED_COUNT=$((GENERATED_COUNT + 1))
-              GENERATED_FILES="$GENERATED_FILES$pdf_file\n"
+              GENERATED_FILES="$GENERATED_FILES$pdf_file"$'\n'
             else
               echo "✗ Failed to generate: $pdf_file"
             fi
             
             # Cleanup
-            rm -f "/tmp/temp.pdf"
+            rm -f "$TEMP_PDF"
           else
             echo "✗ Pandoc failed for: $md_file"
           fi
@@ -203,7 +232,7 @@ add_watermark('/tmp/temp.pdf', '$pdf_file', '$WATERMARK_TEXT')
         
         # Save generated files list
         if [ -n "$GENERATED_FILES" ]; then
-          echo -e "$GENERATED_FILES" > /tmp/generated_pdfs.txt
+          echo "$GENERATED_FILES" | head -c -1 > /tmp/generated_pdfs.txt
         fi
         
         echo "Generated $GENERATED_COUNT PDF(s)"
