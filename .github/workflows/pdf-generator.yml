@@ -28,23 +28,23 @@ jobs:
       contents: write
     
     steps:
-    - name: 📥 Checkout repository
+    - name:  Checkout repository
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
     
-    - name: 🐍 Setup Python
+    - name:  Setup Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
     
-    - name: 📦 Install dependencies
+    - name:  Install dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y pandoc texlive-xetex texlive-fonts-recommended
         pip install PyPDF2 reportlab
     
-    - name: 🔍 Detect files and get REAL commit author
+    - name:  Detect files and get REAL commit author
       id: detect
       run: |
         mkdir -p generated-pdfs
@@ -122,7 +122,7 @@ jobs:
         echo "Final JSON: $JSON_FILES"
         echo "files=$JSON_FILES" >> $GITHUB_OUTPUT
     
-    - name: 🖨️ Generate PDFs
+    - name:  Generate PDFs
       if: steps.detect.outputs.files != '[]'
       id: generate
       env:
@@ -140,7 +140,7 @@ jobs:
         COUNT=$(find generated-pdfs -name "*.pdf" -type f 2>/dev/null | wc -l)
         echo "pdf_count=$COUNT" >> $GITHUB_OUTPUT
     
-    - name: 💾 Commit generated PDFs
+    - name:  Commit generated PDFs
       if: steps.generate.outputs.pdf_count != '0'
       run: |
         git config --local user.email "github-actions[bot]@users.noreply.github.com"
@@ -148,9 +148,9 @@ jobs:
         git add generated-pdfs/
         
         if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-          MSG="📄 Manual PDF generation"
+          MSG=" Manual PDF generation"
         else
-          MSG="🤖 Auto-generated PDF from markdown changes"
+          MSG=" Auto-generated PDF from markdown changes"
         fi
         
         COMMIT_AUTHOR="${{ steps.detect.outputs.commit_author }}"
