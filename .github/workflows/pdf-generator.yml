@@ -1,32 +1,17 @@
-name: Generate PDF from Markdown
+name: Simple PDF Generator
 
 on:
-  # Automatic trigger on .md file changes
   push:
-    paths:
-      - 'doc/**/*.md'
-    branches: [main, master]
+    paths: ['doc/**/*.md']
+    branches: [main]
   
-  # Manual trigger with options
   workflow_dispatch:
     inputs:
-      generation_scope:
-        description: 'What to generate?'
-        required: true
-        default: 'all'
-        type: choice
-        options:
-          - all
-          - specific
-      specific_files:
-        description: 'Specific .md files (comma-separated, e.g., doc/guide.md, doc/api.md)'
+      generate_all:
+        description: 'Generate all PDFs?'
         required: false
-        type: string
-      watermark_text:
-        description: 'Custom watermark text (leave empty for default)'
-        required: false
-        default: ''
-        type: string
+        default: false
+        type: boolean
 
 jobs:
   generate-pdf:
@@ -35,237 +20,93 @@ jobs:
       contents: write
     
     steps:
-    - name: 📥 Checkout repository
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
       with:
-        fetch-depth: 0
+        fetch-depth: 2
     
-    - name: 🐍 Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-    
-    - name: 📦 Install dependencies
+    - name: Setup
       run: |
         sudo apt-get update
         sudo apt-get install -y pandoc texlive-xetex texlive-fonts-recommended
         pip install PyPDF2 reportlab
     
-    - name: 🔍 Get files to process
-      id: get_files
-      shell: bash
+    - name: Find files to process
+      id: find_files
       run: |
-        echo "Event: ${{ github.event_name }}"
-        echo "Scope: ${{ github.event.inputs.generation_scope || 'changed' }}"
-        
-        FILES_TO_PROCESS=""
-        
-        # For manual triggers
-        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-          SCOPE="${{ github.event.inputs.generation_scope || 'all' }}"
-          SPECIFIC="${{ github.event.inputs.specific_files || '' }}"
-          
-          if [ "$SCOPE" == "all" ]; then
-            # Find all .md files in doc/
-            FILES_TO_PROCESS=$(find doc -name "*.md" -type f | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          elif [ "$SCOPE" == "specific" ] && [ -n "$SPECIFIC" ]; then
-            # Process specific files
-            JSON_FILES="["
-            FIRST=true
-            IFS=',' read -ra FILES <<< "$SPECIFIC"
-            for file in "${FILES[@]}"; do
-              file=$(echo "$file" | xargs)  # Trim whitespace
-              if [[ "$file" == *.md ]] && [ -f "$file" ]; then
-                if [ "$FIRST" = true ]; then
-                  FIRST=false
-                else
-                  JSON_FILES="$JSON_FILES,"
-                fi
-                JSON_FILES="$JSON_FILES\"$file\""
-              fi
-            done
-            JSON_FILES="$JSON_FILES]"
-            FILES_TO_PROCESS="$JSON_FILES"
-          fi
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.generate_all }}" == "true" ]]; then
+          # Manual trigger - all files
+          FILES=$(find doc -name "*.md" -type f)
         else
-          # Push event - get changed .md files
-          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD -- 'doc/**/*.md' 2>/dev/null || echo "")
-          if [ -n "$CHANGED_FILES" ]; then
-            JSON_FILES="["
-            FIRST=true
-            while IFS= read -r file; do
-              if [ -n "$file" ] && [ -f "$file" ]; then
-                if [ "$FIRST" = true ]; then
-                  FIRST=false
-                else
-                  JSON_FILES="$JSON_FILES,"
-                fi
-                JSON_FILES="$JSON_FILES\"$file\""
-              fi
-            done <<< "$CHANGED_FILES"
-            JSON_FILES="$JSON_FILES]"
-            FILES_TO_PROCESS="$JSON_FILES"
-          fi
+          # Push event - changed files only
+          FILES=$(git diff --name-only HEAD~1 HEAD -- 'doc/**/*.md' 2>/dev/null || echo "")
         fi
         
-        if [ -z "$FILES_TO_PROCESS" ]; then
-          FILES_TO_PROCESS="[]"
-        fi
-        
-        echo "Files to process: $FILES_TO_PROCESS"
-        echo "files=$FILES_TO_PROCESS" >> $GITHUB_OUTPUT
-    
-    - name: 🖨️ Generate PDFs with watermarks
-      id: generate
-      env:
-        FILES_TO_PROCESS: ${{ steps.get_files.outputs.files }}
-        GITHUB_ACTOR: ${{ github.actor }}
-        INPUT_WATERMARK_TEXT: ${{ github.event.inputs.watermark_text || '' }}
-      run: |
-        echo "Starting PDF generation..."
-        
-        # Create timestamp for watermark
-        TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
-        
-        # Create watermark text
-        if [ -n "$INPUT_WATERMARK_TEXT" ]; then
-          WATERMARK_TEXT="$INPUT_WATERMARK_TEXT"
-        else
-          WATERMARK_TEXT="Generated by $GITHUB_ACTOR on $TIMESTAMP"
-        fi
-        
-        echo "Watermark: $WATERMARK_TEXT"
-        echo "Files to process: $FILES_TO_PROCESS"
-        
-        # Check if we have files to process
-        if [ "$FILES_TO_PROCESS" = "[]" ]; then
+        if [ -z "$FILES" ]; then
           echo "No files to process"
-          echo "pdf_count=0" >> $GITHUB_OUTPUT
+          echo "files=" >> $GITHUB_OUTPUT
+          echo "file_count=0" >> $GITHUB_OUTPUT
           exit 0
         fi
         
-        # Parse JSON array
-        FILES_ARRAY=$(echo "$FILES_TO_PROCESS" | python3 -c "import sys, json; data=json.load(sys.stdin); print(' '.join(data))")
+        echo "$FILES" > /tmp/files.txt
+        echo "files=$FILES" >> $GITHUB_OUTPUT
+        echo "file_count=$(echo "$FILES" | wc -l)" >> $GITHUB_OUTPUT
+    
+    - name: Generate PDFs
+      if: steps.find_files.outputs.file_count != '0'
+      run: |
+        TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
+        ACTOR="${{ github.actor }}"
         
-        GENERATED_COUNT=0
-        GENERATED_FILES=""
-        
-        # Process each file
-        for md_file in $FILES_ARRAY; do
-          if [ ! -f "$md_file" ]; then
-            echo "File not found: $md_file"
-            continue
-          fi
-          
-          echo "Processing: $md_file"
-          
-          # Create PDF filename
-          pdf_file="${md_file%.md}.pdf"
-          
-          # Convert markdown to PDF using pandoc
-          TEMP_PDF="/tmp/$(basename "$pdf_file")"
-          
-          if pandoc "$md_file" -o "$TEMP_PDF" --pdf-engine=xelatex \
-            -V geometry:margin=1in -V fontsize=11pt --toc --toc-depth=3; then
+        while read md_file; do
+          if [ -f "$md_file" ]; then
+            echo "Processing: $md_file"
+            pdf_file="${md_file%.md}.pdf"
             
-            # Add watermark using Python
+            # Generate PDF
+            pandoc "$md_file" -o "$pdf_file" --pdf-engine=xelatex
+            
+            # Simple watermark using Python
             python3 -c "
-import sys
 from PyPDF2 import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.colors import gray
 from io import BytesIO
+import sys
 
-def add_watermark(input_pdf, output_pdf, watermark_text):
-    reader = PdfReader(input_pdf)
-    writer = PdfWriter()
-    
-    for page in reader.pages:
-        packet = BytesIO()
-        page_width = float(page.mediabox.width)
-        page_height = float(page.mediabox.height)
-        
-        can = canvas.Canvas(packet, pagesize=(page_width, page_height))
-        can.setFont('Helvetica-Bold', 40)
-        can.setFillColor(gray, alpha=0.15)
-        can.saveState()
-        can.translate(page_width / 2, page_height / 2)
-        can.rotate(45)
-        
-        # Draw watermark multiple times for coverage
-        for i in range(-2, 3):
-            for j in range(-2, 3):
-                x = i * 300
-                y = j * 200
-                can.drawString(x, y, watermark_text)
-        
-        can.restoreState()
-        can.save()
-        
-        packet.seek(0)
-        watermark_pdf = PdfReader(packet)
-        watermark_page = watermark_pdf.pages[0]
-        page.merge_page(watermark_page)
-        writer.add_page(page)
-    
-    with open(output_pdf, 'wb') as f:
-        writer.write(f)
+input_pdf = sys.argv[1]
+output_pdf = sys.argv[2]
+watermark_text = sys.argv[3]
 
-add_watermark('$TEMP_PDF', '$pdf_file', '$WATERMARK_TEXT')
-            "
+reader = PdfReader(input_pdf)
+writer = PdfWriter()
+
+for page in reader.pages:
+    packet = BytesIO()
+    can = canvas.Canvas(packet, pagesize=(600, 800))
+    can.setFont('Helvetica', 20)
+    can.setFillColorRGB(0.5, 0.5, 0.5, alpha=0.3)
+    can.drawString(50, 50, watermark_text)
+    can.save()
+    
+    packet.seek(0)
+    from PyPDF2 import PdfReader as WatermarkReader
+    watermark = WatermarkReader(packet)
+    page.merge_page(watermark.pages[0])
+    writer.add_page(page)
+
+with open(output_pdf, 'wb') as f:
+    writer.write(f)
+            " "$pdf_file" "$pdf_file" "Generated by $ACTOR on $TIMESTAMP"
             
-            if [ $? -eq 0 ] && [ -f "$pdf_file" ]; then
-              echo "✓ Generated: $pdf_file"
-              GENERATED_COUNT=$((GENERATED_COUNT + 1))
-              GENERATED_FILES="$GENERATED_FILES$pdf_file"$'\n'
-            else
-              echo "✗ Failed to generate: $pdf_file"
-            fi
-            
-            # Cleanup
-            rm -f "$TEMP_PDF"
-          else
-            echo "✗ Pandoc failed for: $md_file"
+            echo "Generated: $pdf_file"
           fi
-        done
-        
-        # Save generated files list
-        if [ -n "$GENERATED_FILES" ]; then
-          echo "$GENERATED_FILES" | head -c -1 > /tmp/generated_pdfs.txt
-        fi
-        
-        echo "Generated $GENERATED_COUNT PDF(s)"
-        echo "pdf_count=$GENERATED_COUNT" >> $GITHUB_OUTPUT
+        done < /tmp/files.txt
     
-    - name: 💾 Commit generated PDFs
-      if: steps.generate.outputs.pdf_count != '0'
+    - name: Commit PDFs
+      if: steps.find_files.outputs.file_count != '0'
       run: |
-        echo "Committing ${{ steps.generate.outputs.pdf_count }} PDF(s)..."
-        
-        # Configure git
-        git config --local user.email "github-actions[bot]@users.noreply.github.com"
-        git config --local user.name "github-actions[bot]"
-        
-        # Add all generated PDFs
-        if [ -f /tmp/generated_pdfs.txt ]; then
-          while IFS= read -r pdf_file; do
-            if [ -n "$pdf_file" ] && [ -f "$pdf_file" ]; then
-              git add "$pdf_file"
-              echo "Added: $pdf_file"
-            fi
-          done < /tmp/generated_pdfs.txt
-        fi
-        
-        # Create commit message
-        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-          COMMIT_MSG="📄 Manually generated PDF(s)"
-        else
-          COMMIT_MSG="🤖 Auto-generated PDF(s) from markdown changes"
-        fi
-        
-        COMMIT_MSG="$COMMIT_MSG - ${{ steps.generate.outputs.pdf_count }} file(s)"
-        
-        # Commit and push
-        git commit -m "$COMMIT_MSG [skip ci]" || echo "No changes to commit"
+        git config user.email "github-actions@example.com"
+        git config user.name "GitHub Actions"
+        git add doc/**/*.pdf
+        git commit -m "Generated PDFs [skip ci]" || echo "No changes"
         git push
