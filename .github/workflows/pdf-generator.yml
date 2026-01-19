@@ -1,34 +1,33 @@
 name: Generate PDFs from Markdown
 
 on:
-  # Automatic trigger when .md files change in doc/
   push:
     paths:
       - 'doc/**/*.md'
     branches: [main, master]
   
-  # Manual trigger with options
   workflow_dispatch:
     inputs:
-      generation_scope:
-        description: 'Generation scope'
+      scope:
+        description: 'Generate'
         required: true
-        default: 'all'
+        default: 'changed'
         type: choice
         options:
+          - changed
           - all
           - specific
-      specific_files:
+      files:
         description: 'Specific files (comma-separated, e.g., doc/guide.md,doc/api.md)'
         required: false
         type: string
-      watermark_text:
-        description: 'Custom watermark (optional)'
+      watermark:
+        description: 'Custom watermark text'
         required: false
         type: string
 
 jobs:
-  generate-pdf:
+  generate:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -37,49 +36,73 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # Required for git diff
+        fetch-depth: 2  # Minimal but sufficient for diff
     
-    - name: Setup Python environment
+    - name: Setup Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
+        cache: 'pip'
     
-    - name: Install system dependencies
+    - name: Install dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install -y pandoc texlive-xetex texlive-fonts-recommended
-        
-    - name: Install Python packages
-      run: pip install PyPDF2 reportlab
+        sudo apt-get update -qq
+        sudo apt-get install -y pandoc texlive-xetex texlive-fonts-recommended texlive-plain-generic
+        pip install --quiet PyPDF2 reportlab
     
     - name: Detect files to process
-      id: file-detector
-      run: |
-        python scripts/detect_changed_files.py
-        
-    - name: Generate PDFs with watermarks
-      id: pdf-generator
+      id: detect
       env:
-        FILES_JSON: ${{ steps.file-detector.outputs.files }}
-        WATERMARK_TEXT: ${{ github.event.inputs.watermark_text || '' }}
+        EVENT_NAME: ${{ github.event_name }}
+        SCOPE: ${{ github.event.inputs.scope }}
+        SPECIFIC_FILES: ${{ github.event.inputs.files }}
       run: |
-        python scripts/generate_pdfs.py "$FILES_JSON"
+        echo "=== File Detection Debug ==="
+        echo "Event: $EVENT_NAME"
+        echo "Scope: $SCOPE"
         
-    - name: Commit generated PDFs
-      if: steps.pdf-generator.outputs.pdf_count != '0'
+        FILES="[]"
+        
+        if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          if [ "$SCOPE" = "all" ]; then
+            FILES=$(find doc -name "*.md" -type f | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          elif [ "$SCOPE" = "specific" ] && [ -n "$SPECIFIC_FILES" ]; then
+            FILES=$(echo "$SPECIFIC_FILES" | jq -R -s -c 'split(",") | map(select(length > 0))')
+          fi
+        else
+          # For push events - try multiple diff strategies
+          if git rev-parse HEAD~1 >/dev/null 2>&1; then
+            # Standard approach
+            CHANGED=$(git diff --name-only HEAD~1 HEAD -- 'doc/*.md' 'doc/**/*.md' 2>/dev/null || echo "")
+          else
+            # Fallback for shallow clones or initial commits
+            CHANGED=$(git diff --name-only $(git hash-object -t tree /dev/null) HEAD -- 'doc/*.md' 'doc/**/*.md' 2>/dev/null || echo "")
+          fi
+          
+          if [ -n "$CHANGED" ]; then
+            FILES=$(echo "$CHANGED" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          fi
+        fi
+        
+        echo "Files: $FILES"
+        echo "files=$FILES" >> $GITHUB_OUTPUT
+    
+    - name: Generate PDFs
+      if: steps.detect.outputs.files != '[]'
+      id: generate
+      env:
+        FILES_JSON: ${{ steps.detect.outputs.files }}
+        ACTOR: ${{ github.actor }}
+        CUSTOM_WATERMARK: ${{ github.event.inputs.watermark }}
+      run: |
+        python scripts/generate_pdfs.py
+        
+    - name: Commit PDFs
+      if: steps.generate.outputs.pdf_count != '0'
       run: |
         git config --local user.email "github-actions[bot]@users.noreply.github.com"
         git config --local user.name "github-actions[bot]"
         
-        # Add PDFs to git
-        git add generated-pdfs/*.pdf
-        
-        # Create commit message
-        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-          MSG="📄 Manual PDF generation: ${{ steps.pdf-generator.outputs.pdf_count }} file(s)"
-        else
-          MSG="🤖 Auto-generated PDF(s) from markdown changes"
-        fi
-        
-        git commit -m "$MSG [skip ci]" || echo "No changes to commit"
+        git add doc/**/*.pdf
+        git commit -m "🤖 Auto-generate PDFs (${{ steps.generate.outputs.pdf_count }}) [skip ci]" || echo "No changes"
         git push
